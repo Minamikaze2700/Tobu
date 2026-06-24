@@ -126,16 +126,23 @@
                 <option value="center">中央揃え</option>
                 <option value="right">右寄せ</option>
                 <option value="scroll">スクロール</option>
+                <option value="runinfo">運行情報を表示</option>
             </select>
             <button id="updateBtn">更新・反映</button>
         </div>
+        <div class="legend" id="runInfoNote" style="margin-top: 4px;">
+            「運行情報を表示」は同階層の「運行情報.txt」を自動読み込みして、1行ずつ順番に流します。
+        </div>
         <div class="control-group" style="margin-top: 15px;">
-            <label for="exportFormat">画像出力:</label>
+            <label for="exportFormat">出力形式:</label>
             <select id="exportFormat">
                 <option value="png">PNG</option>
                 <option value="jpg">JPG</option>
             </select>
             <button id="exportBtn">画像を出力</button>
+        </div>
+        <div class="legend" id="exportNote" style="margin-top: 4px;">
+            スクロール／運行情報表示時は動画を、その他の表示では画像を出力します。
         </div>
     </div>
 
@@ -7799,15 +7806,16 @@ const FONT_DATA = {
         [0,0,0,0,0,0,0,0]
     ],
     ' ': Array.from({length: 16}, () => Array(8).fill(0))
-};
-
-
-// ベースとなる3色LEDの発光カラー定義
+};// ベースとなる3色LEDの発光カラー定義
 const BASE_COLORS = {
-    1: { r: 128, g: 255, b: 0 },   // 黄緑
-    2: { r: 255, g: 0,   b: 64 },  // 赤
-    3: { r: 255, g: 128, b: 64 }   // 橙
+    1: { r: 128, g: 255, b: 0,   css: 'rgb(128,255,0)' },  // 黄緑
+    2: { r: 255, g: 0,   b: 64,  css: 'rgb(255,0,64)' },    // 赤
+    3: { r: 255, g: 128, b: 64,  css: 'rgb(255,128,64)' }   // 橙
 };
+
+const RUN_INFO_FILE_NAME = '運行情報.txt';
+const RUN_INFO_REFRESH_INTERVAL_MS = 5000;
+const RUN_INFO_GAP_COLUMNS = 160;
 
 const canvas = document.getElementById('ledCanvas');
 const ctx = canvas.getContext('2d');
@@ -7817,9 +7825,18 @@ const COLS = 160;
 const DOT_SIZE = 4;
 const GAP = 2;
 const STEP = DOT_SIZE + GAP;
+const DISPLAY_SCROLL_COLUMNS_PER_SECOND = 60;
+const DISPLAY_FADE_ALPHA_PER_SECOND = 45;
+const VIDEO_SCROLL_COLUMNS_PER_SECOND = 60;
 
 let scrollOffset = 0;
 let animationFrameId = null;
+let scrollStartTimestamp = null;
+let runInfoAnimationFrameId = null;
+let runInfoPollTimerId = null;
+let runInfoKnownLines = new Set();
+let runInfoLastSourceText = '';
+let runInfoSequence = { matrix: null, totalWidth: 0 };
 
 // 【新規追加】ディスプレイ上の各ドットの状態（色情報と現在の輝度）を記録するバッファ
 const displayBuffer = Array.from({ length: ROWS }, () => 
@@ -7832,6 +7849,52 @@ function getGlyphWidth(char) {
         return glyph[0].length;
     }
     return char.charCodeAt(0) > 255 ? 16 : 8;
+}
+
+const runtimeGlyphCache = new Map();
+const runtimeGlyphCanvas = document.createElement('canvas');
+
+function rasterizeGlyph(char, width) {
+    const cacheKey = `${char}:${width}`;
+    if (runtimeGlyphCache.has(cacheKey)) {
+        return runtimeGlyphCache.get(cacheKey);
+    }
+
+    const glyphWidth = Math.max(8, width);
+    runtimeGlyphCanvas.width = glyphWidth;
+    runtimeGlyphCanvas.height = ROWS;
+    const gctx = runtimeGlyphCanvas.getContext('2d', { willReadFrequently: true });
+
+    gctx.clearRect(0, 0, glyphWidth, ROWS);
+    gctx.fillStyle = '#ffffff';
+    gctx.fillRect(0, 0, glyphWidth, ROWS);
+    gctx.fillStyle = '#000000';
+    gctx.textAlign = 'center';
+    gctx.textBaseline = 'middle';
+    gctx.font = `${width >= 16 ? 14 : 8}px sans-serif`;
+    gctx.fillText(char, glyphWidth / 2, ROWS / 2 + 1);
+
+    const imageData = gctx.getImageData(0, 0, glyphWidth, ROWS).data;
+    const glyph = Array.from({ length: ROWS }, () => Array(glyphWidth).fill(0));
+
+    for (let row = 0; row < ROWS; row++) {
+        for (let col = 0; col < glyphWidth; col++) {
+            const idx = (row * glyphWidth + col) * 4;
+            const brightness = (imageData[idx] + imageData[idx + 1] + imageData[idx + 2]) / 3;
+            glyph[row][col] = brightness < 200 ? 1 : 0;
+        }
+    }
+
+    runtimeGlyphCache.set(cacheKey, glyph);
+    return glyph;
+}
+
+function getGlyphBitmap(char) {
+    const glyph = FONT_DATA[char];
+    if (glyph && glyph.length > 0 && Array.isArray(glyph[0])) {
+        return glyph;
+    }
+    return rasterizeGlyph(char, getGlyphWidth(char));
 }
 
 function parseText(text) {
@@ -7938,84 +8001,224 @@ function drawLEDWithAfterglow() {
     }
 }
 
-function updateDisplay() {
+function clearAnimationState() {
     if (animationFrameId) {
         cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
     }
-    
-    const text = document.getElementById('inputText').value;
-    const align = document.getElementById('alignSelect').value;
-    
-    const tokens = parseText(text);
-    const { matrix, totalWidth } = generateMessageMatrix(tokens);
-    
-    if (align === 'scroll') {
-        scrollOffset = -COLS;
-        
-        function animate() {
-            // 1. まず現在の画面バッファ全体の輝度を一歩下げる（残光フェードアウト）
-            // 0.75の速度に合わせ、1フレームあたりの減衰量を「0.35」に調整（ここを小さくすると尾を長く引きます）
-            for (let row = 0; row < ROWS; row++) {
-                for (let col = 0; col < COLS; col++) {
-                    displayBuffer[row][col].alpha -= 0.75; 
-                    if (displayBuffer[row][col].alpha < 0) {
-                        displayBuffer[row][col].alpha = 0;
-                    }
-                }
-            }
-            
-            // 2. 現在のスクロール位置における文字データを、現在の輝度(1.0)としてバッファに上書き（点灯）
-            const intScrollOffset = Math.floor(scrollOffset);
-            for (let row = 0; row < ROWS; row++) {
-                for (let col = 0; col < COLS; col++) {
-                    const matrixX = col + intScrollOffset;
-                    if (matrixX >= 0 && matrixX < totalWidth) {
-                        const colorType = matrix[row][matrixX];
-                        if (colorType !== 0) {
-                            displayBuffer[row][col].colorType = colorType;
-                            displayBuffer[row][col].alpha = 1.0; // 点灯したドットは輝度マックス
-                        }
-                    }
-                }
-            }
-            
-            // 3. 計算されたバッファを使って描画
-            drawLEDWithAfterglow();
-            
-            // 4. 前回の速度指定通り、75%の速さ（0.75）で進める
-            scrollOffset += 1;
-            
-            if (scrollOffset > totalWidth) {
-                scrollOffset = -COLS;
-            }
-            animationFrameId = requestAnimationFrame(animate);
+    if (runInfoAnimationFrameId) {
+        cancelAnimationFrame(runInfoAnimationFrameId);
+        runInfoAnimationFrameId = null;
+    }
+}
+
+function stopRunInfoAutoRefresh() {
+    if (runInfoPollTimerId) {
+        clearInterval(runInfoPollTimerId);
+        runInfoPollTimerId = null;
+    }
+}
+
+function splitRunInfoLines(rawText) {
+    return rawText
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+}
+
+function buildRunInfoEntries(lines) {
+    const uniqueLines = [];
+    const seen = new Set();
+    for (const line of lines) {
+        if (!seen.has(line)) {
+            seen.add(line);
+            uniqueLines.push(line);
         }
-        animate();
-    } else {
-        // 固定配置（左寄せ・中央・右寄せ）の場合は残光処理を行わず一発描画
-        let startX = 0;
-        if (align === 'center') {
-            startX = Math.floor((COLS - totalWidth) / 2);
-        } else if (align === 'right') {
-            startX = COLS - totalWidth;
+    }
+
+    const newLines = [];
+    const existingLines = [];
+    for (const line of uniqueLines) {
+        if (runInfoKnownLines.has(line)) {
+            existingLines.push(line);
+        } else {
+            newLines.push(line);
         }
-        
-        // バッファをクリアして固定文字をセット
+    }
+
+    runInfoKnownLines = new Set(uniqueLines);
+    const ordered = [...newLines, ...existingLines];
+    if (ordered.length === 0) {
+        return ['現在、運行情報はありません'];
+    }
+    return ordered;
+}
+
+function buildRunInfoSequence(lines) {
+    const entries = lines.map(line => {
+        const tokens = parseText(`<2><運行情報>　<3>${line}`);
+        return generateMessageMatrix(tokens);
+    });
+
+    const totalWidth = entries.reduce((sum, entry) => sum + entry.totalWidth, 0)
+        + RUN_INFO_GAP_COLUMNS * Math.max(0, entries.length - 1);
+
+    const matrix = Array.from({ length: ROWS }, () => Array(totalWidth).fill(0));
+    let cursor = 0;
+
+    entries.forEach((entry, index) => {
+        for (let row = 0; row < ROWS; row++) {
+            for (let col = 0; col < entry.totalWidth; col++) {
+                matrix[row][cursor + col] = entry.matrix[row][col];
+            }
+        }
+        cursor += entry.totalWidth;
+        if (index < entries.length - 1) {
+            cursor += RUN_INFO_GAP_COLUMNS;
+        }
+    });
+
+    return { matrix, totalWidth };
+}
+
+async function fetchRunInfoText() {
+    try {
+        const response = await fetch(RUN_INFO_FILE_NAME, { cache: 'no-store' });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        return await response.text();
+    } catch (error) {
+        return DEFAULT_RUN_INFO_TEXT;
+    }
+}
+
+async function refreshRunInfoSequence({ preservePriority = true } = {}) {
+    const rawText = await fetchRunInfoText();
+    if (rawText === runInfoLastSourceText && runInfoSequence.matrix) {
+        return false;
+    }
+
+    const lines = splitRunInfoLines(rawText);
+    if (!preservePriority) {
+        runInfoKnownLines = new Set();
+    }
+    const orderedLines = buildRunInfoEntries(lines);
+    runInfoSequence = buildRunInfoSequence(orderedLines);
+    runInfoLastSourceText = rawText;
+    return true;
+}
+
+function startScrollingSequence(sequenceMatrix, totalWidth) {
+    clearAnimationState();
+    scrollOffset = -COLS;
+    scrollStartTimestamp = null;
+
+    function animate(timestamp) {
+        if (scrollStartTimestamp === null) {
+            scrollStartTimestamp = timestamp;
+        }
+        const deltaSec = Math.min((timestamp - scrollStartTimestamp) / 1000, 0.05);
+        scrollStartTimestamp = timestamp;
+
+        const fadeAmount = DISPLAY_FADE_ALPHA_PER_SECOND * deltaSec;
         for (let row = 0; row < ROWS; row++) {
             for (let col = 0; col < COLS; col++) {
-                const matrixX = col - startX;
-                if (matrixX >= 0 && matrixX < totalWidth) {
-                    const colorType = matrix[row][matrixX];
-                    displayBuffer[row][col].colorType = colorType;
-                    displayBuffer[row][col].alpha = colorType !== 0 ? 1.0 : 0;
-                } else {
-                    displayBuffer[row][col].colorType = 0;
+                displayBuffer[row][col].alpha -= fadeAmount;
+                if (displayBuffer[row][col].alpha < 0) {
                     displayBuffer[row][col].alpha = 0;
                 }
             }
         }
+
+        const intScrollOffset = Math.floor(scrollOffset);
+        for (let row = 0; row < ROWS; row++) {
+            for (let col = 0; col < COLS; col++) {
+                const matrixX = col + intScrollOffset;
+                if (matrixX >= 0 && matrixX < totalWidth) {
+                    const colorType = sequenceMatrix[row][matrixX];
+                    if (colorType !== 0) {
+                        displayBuffer[row][col].colorType = colorType;
+                        displayBuffer[row][col].alpha = 1.0;
+                    }
+                }
+            }
+        }
+
         drawLEDWithAfterglow();
+
+        scrollOffset += DISPLAY_SCROLL_COLUMNS_PER_SECOND * deltaSec;
+        if (scrollOffset > totalWidth) {
+            scrollOffset = -COLS;
+        }
+        animationFrameId = requestAnimationFrame(animate);
     }
+
+    animationFrameId = requestAnimationFrame(animate);
+}
+
+async function startRunInfoMode() {
+    await refreshRunInfoSequence({ preservePriority: true });
+    startScrollingSequence(runInfoSequence.matrix, runInfoSequence.totalWidth);
+    stopRunInfoAutoRefresh();
+    runInfoPollTimerId = setInterval(async () => {
+        if (document.getElementById('alignSelect').value !== 'runinfo') {
+            stopRunInfoAutoRefresh();
+            return;
+        }
+        const changed = await refreshRunInfoSequence({ preservePriority: true });
+        if (changed) {
+            startScrollingSequence(runInfoSequence.matrix, runInfoSequence.totalWidth);
+        }
+    }, RUN_INFO_REFRESH_INTERVAL_MS);
+}
+
+
+async function updateDisplay() {
+    clearAnimationState();
+    stopRunInfoAutoRefresh();
+
+    const text = document.getElementById('inputText').value;
+    const align = document.getElementById('alignSelect').value;
+
+    if (align === 'scroll') {
+        const tokens = parseText(text);
+        const { matrix, totalWidth } = generateMessageMatrix(tokens);
+        startScrollingSequence(matrix, totalWidth);
+        return;
+    }
+
+    if (align === 'runinfo') {
+        await startRunInfoMode();
+        return;
+    }
+
+    const tokens = parseText(text);
+    const { matrix, totalWidth } = generateMessageMatrix(tokens);
+
+    // 固定配置（左寄せ・中央・右寄せ）の場合は残光処理を行わず一発描画
+    let startX = 0;
+    if (align === 'center') {
+        startX = Math.floor((COLS - totalWidth) / 2);
+    } else if (align === 'right') {
+        startX = COLS - totalWidth;
+    }
+
+    // バッファをクリアして固定文字をセット
+    for (let row = 0; row < ROWS; row++) {
+        for (let col = 0; col < COLS; col++) {
+            const matrixX = col - startX;
+            if (matrixX >= 0 && matrixX < totalWidth) {
+                const colorType = matrix[row][matrixX];
+                displayBuffer[row][col].colorType = colorType;
+                displayBuffer[row][col].alpha = colorType !== 0 ? 1.0 : 0;
+            } else {
+                displayBuffer[row][col].colorType = 0;
+                displayBuffer[row][col].alpha = 0;
+            }
+        }
+    }
+    drawLEDWithAfterglow();
 }
 
 document.getElementById('updateBtn').addEventListener('click', updateDisplay);
@@ -8025,12 +8228,21 @@ document.getElementById('inputText').addEventListener('keypress', function(e) {
 
 const exportBtn = document.getElementById('exportBtn');
 const exportFormat = document.getElementById('exportFormat');
+const exportNote = document.getElementById('exportNote');
 
 function updateExportButtonState() {
-    const isScroll = document.getElementById('alignSelect').value === 'scroll';
-    exportBtn.disabled = isScroll;
-    exportBtn.style.opacity = isScroll ? '0.5' : '1';
-    exportBtn.style.cursor = isScroll ? 'not-allowed' : 'pointer';
+    const isScrollLike = document.getElementById('alignSelect').value === 'scroll'
+        || document.getElementById('alignSelect').value === 'runinfo';
+    exportFormat.disabled = isScrollLike;
+    exportFormat.style.opacity = isScrollLike ? '0.5' : '1';
+    exportFormat.style.cursor = isScrollLike ? 'not-allowed' : 'pointer';
+    exportBtn.disabled = false;
+    exportBtn.textContent = isScrollLike ? '動画を出力' : '画像を出力';
+    exportBtn.style.opacity = '1';
+    exportBtn.style.cursor = 'pointer';
+    exportNote.textContent = isScrollLike
+        ? 'スクロール／運行情報表示時は動画を出力します。'
+        : 'スクロール／運行情報表示時以外は画像を出力します。';
 }
 
 function svgToDataURL(svgElement) {
@@ -8078,7 +8290,8 @@ function drawRoundedRect(ctx, x, y, width, height, radius) {
 }
 
 async function exportVisibleImage() {
-    if (document.getElementById('alignSelect').value === 'scroll') {
+    const currentMode = document.getElementById('alignSelect').value;
+    if (currentMode === 'scroll' || currentMode === 'runinfo') {
         alert('スクロール表示中は画像出力できません。左寄せ・中央揃え・右寄せに切り替えてください。');
         return;
     }
@@ -8149,7 +8362,230 @@ async function exportVisibleImage() {
     a.remove();
 }
 
-exportBtn.addEventListener('click', exportVisibleImage);
+
+const videoBtn = document.getElementById('videoBtn');
+const captureArea = document.getElementById('captureArea');
+const ledContainer = document.getElementById('led-container');
+const ledSvg = document.querySelector('.speaker-grille');
+
+function nextFrame() {
+    return new Promise(resolve => requestAnimationFrame(() => resolve()));
+}
+
+function getCaptureMetrics() {
+    const areaRect = captureArea.getBoundingClientRect();
+    const ledRect = ledContainer.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    const svgRect = ledSvg.getBoundingClientRect();
+
+    return {
+        areaRect,
+        ledRect,
+        canvasRect,
+        svgRect,
+        areaBg: getComputedStyle(captureArea).backgroundColor || '#d3d3d3',
+        ledBg: getComputedStyle(ledContainer).backgroundColor || '#181818',
+        ledRadius: parseBorderRadius(getComputedStyle(ledContainer).borderRadius),
+    };
+}
+
+function buildScrollExportMatrix(tokens) {
+    const { matrix, totalWidth } = generateMessageMatrix(tokens);
+    const padCols = 32;
+    const paddedWidth = totalWidth + padCols * 2;
+    const padded = Array.from({ length: ROWS }, () => Array(paddedWidth).fill(0));
+
+    for (let row = 0; row < ROWS; row++) {
+        for (let col = 0; col < totalWidth; col++) {
+            padded[row][padCols + col] = matrix[row][col];
+        }
+    }
+
+    return {
+        matrix: padded,
+        totalWidth: paddedWidth,
+        visibleWidth: COLS,
+        padCols,
+    };
+}
+
+function drawMatrixFrame(targetCtx, matrix, drawX, drawY, scrollOffset = 0) {
+    const baseX = Number.isFinite(drawX) ? drawX : 0;
+    const baseY = Number.isFinite(drawY) ? drawY : 0;
+    const offset = Number.isFinite(scrollOffset) ? Math.floor(scrollOffset) : 0;
+
+    for (let row = 0; row < ROWS; row++) {
+        for (let col = 0; col < COLS; col++) {
+            const matrixX = col + offset;
+            const colorType = (matrixX >= 0 && matrixX < matrix[0].length) ? matrix[row][matrixX] : 0;
+            const base = BASE_COLORS[colorType];
+            const fillStyle = colorType === 0 ? '#252525' : (base?.css || `rgb(${base.r},${base.g},${base.b})`);
+
+            const x = baseX + col * STEP + GAP;
+            const y = baseY + row * STEP + GAP;
+            const r = DOT_SIZE * 0.25;
+
+            targetCtx.beginPath();
+            targetCtx.moveTo(x + r, y);
+            targetCtx.lineTo(x + DOT_SIZE - r, y);
+            targetCtx.quadraticCurveTo(x + DOT_SIZE, y, x + DOT_SIZE, y + r);
+            targetCtx.lineTo(x + DOT_SIZE, y + DOT_SIZE - r);
+            targetCtx.quadraticCurveTo(x + DOT_SIZE, y + DOT_SIZE, x + DOT_SIZE - r, y + DOT_SIZE);
+            targetCtx.lineTo(x + r, y + DOT_SIZE);
+            targetCtx.quadraticCurveTo(x, y + DOT_SIZE, x, y + DOT_SIZE - r);
+            targetCtx.lineTo(x, y + r);
+            targetCtx.quadraticCurveTo(x, y, x + r, y);
+            targetCtx.closePath();
+            targetCtx.fillStyle = fillStyle;
+            targetCtx.fill();
+        }
+    }
+}
+
+async function createStaticCaptureBase(metrics) {
+    const baseCanvas = document.createElement('canvas');
+    baseCanvas.width = Math.round(metrics.areaRect.width);
+    baseCanvas.height = Math.round(metrics.areaRect.height);
+    const baseCtx = baseCanvas.getContext('2d');
+
+    baseCtx.fillStyle = metrics.areaBg;
+    baseCtx.fillRect(0, 0, baseCanvas.width, baseCanvas.height);
+
+    const ledX = Math.round(metrics.ledRect.left - metrics.areaRect.left);
+    const ledY = Math.round(metrics.ledRect.top - metrics.areaRect.top);
+    const ledW = Math.round(metrics.ledRect.width);
+    const ledH = Math.round(metrics.ledRect.height);
+
+    baseCtx.fillStyle = metrics.ledBg;
+    drawRoundedRect(baseCtx, ledX, ledY, ledW, ledH, metrics.ledRadius);
+    baseCtx.fill();
+
+    const canvasX = Math.round(metrics.canvasRect.left - metrics.areaRect.left);
+    const canvasY = Math.round(metrics.canvasRect.top - metrics.areaRect.top);
+    const canvasW = Math.round(metrics.canvasRect.width);
+    const canvasH = Math.round(metrics.canvasRect.height);
+    baseCtx.fillStyle = '#000000';
+    baseCtx.fillRect(canvasX, canvasY, canvasW, canvasH);
+
+    const svgImg = new Image();
+    svgImg.src = svgToDataURL(ledSvg);
+    await new Promise((resolve, reject) => {
+        svgImg.onload = resolve;
+        svgImg.onerror = reject;
+    });
+
+    const svgX = Math.round(metrics.svgRect.left - metrics.areaRect.left);
+    const svgY = Math.round(metrics.svgRect.top - metrics.areaRect.top);
+    baseCtx.drawImage(svgImg, svgX, svgY, Math.round(metrics.svgRect.width), Math.round(metrics.svgRect.height));
+
+    return baseCanvas;
+}
+
+function pickRecorderMimeType() {
+    const candidates = [
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm'
+    ];
+
+    for (const type of candidates) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) {
+            return type;
+        }
+    }
+    return '';
+}
+
+
+async function exportScrollVideo() {
+    const align = document.getElementById('alignSelect').value;
+    if (align !== 'scroll' && align !== 'runinfo') {
+        alert('動画出力は「スクロール」か「運行情報を表示」のときだけ使えます。');
+        return;
+    }
+
+    let exportData;
+    if (align === 'runinfo') {
+        await refreshRunInfoSequence({ preservePriority: true });
+        exportData = runInfoSequence;
+    } else {
+        const text = document.getElementById('inputText').value;
+        const tokens = parseText(text);
+        exportData = buildScrollExportMatrix(tokens);
+    }
+
+    const metrics = getCaptureMetrics();
+    const baseCanvas = await createStaticCaptureBase(metrics);
+
+    const outWidth = Math.round(metrics.areaRect.width);
+    const outHeight = Math.round(metrics.areaRect.height);
+    const videoCanvas = document.createElement('canvas');
+    videoCanvas.width = outWidth;
+    videoCanvas.height = outHeight;
+    const videoCtx = videoCanvas.getContext('2d');
+    videoCtx.imageSmoothingEnabled = false;
+
+    const canvasX = Math.round(metrics.canvasRect.left - metrics.areaRect.left);
+    const canvasY = Math.round(metrics.canvasRect.top - metrics.areaRect.top);
+
+    const mimeType = pickRecorderMimeType();
+    if (!mimeType) {
+        alert('このブラウザでは動画録画機能が使えません。');
+        return;
+    }
+
+    const fps = 30;
+    const stream = videoCanvas.captureStream(fps);
+    const chunks = [];
+    const recorder = new MediaRecorder(stream, { mimeType });
+
+    recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+
+    const stopped = new Promise(resolve => {
+        recorder.onstop = resolve;
+    });
+
+    recorder.start();
+
+    // 画面表示と切り離して、1フレームごとの位置を完全固定で生成する
+    const scrollColsPerFrame = VIDEO_SCROLL_COLUMNS_PER_SECOND / fps;
+    const startOffset = -COLS;
+    const endOffset = exportData.totalWidth;
+    const totalFrames = Math.ceil((endOffset - startOffset) / scrollColsPerFrame) + 1;
+
+    for (let frame = 0; frame < totalFrames; frame++) {
+        const offset = startOffset + frame * scrollColsPerFrame;
+        videoCtx.clearRect(0, 0, outWidth, outHeight);
+        videoCtx.drawImage(baseCanvas, 0, 0);
+        drawMatrixFrame(videoCtx, exportData.matrix, canvasX, canvasY, offset);
+        await nextFrame();
+    }
+
+    recorder.stop();
+    await stopped;
+
+    const ext = 'webm';
+    const blob = new Blob(chunks, { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `led_scroll_video.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+('click', async () => {
+    const align = document.getElementById('alignSelect').value;
+    if (align === 'scroll') {
+        await exportScrollVideo();
+    } else {
+        await exportVisibleImage();
+    }
+});
 document.getElementById('alignSelect').addEventListener('change', updateExportButtonState);
 updateExportButtonState();
 
