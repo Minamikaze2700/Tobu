@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -7925,7 +7926,7 @@ function rasterizeGlyph(char, width, options = {}) {
     gctx.imageSmoothingEnabled = false;
     const fontSize = width >= 16 ? 16 : 8;
     gctx.font = `${fontSize}px "${fontFamily}", sans-serif`;
-    gctx.fillText(char, glyphWidth / 2, ROWS / 2 + 1);
+    gctx.fillText(char, glyphWidth / 2, ROWS / 2);
 
     const imageData = gctx.getImageData(0, 0, glyphWidth, ROWS).data;
     const glyph = Array.from({ length: ROWS }, () => Array(glyphWidth).fill(0));
