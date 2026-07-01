@@ -1,15 +1,1 @@
-{
-  "items": [
-    {
-      "id": "mr1qw6db-vx71ur4u",
-      "routeJa": "東武野田線",
-      "routeEn": "Noda Line",
-      "time": "１２：３４",
-      "reason": "設備点検",
-      "note": "",
-      "status": "delay",
-      "createdAt": "2026-07-01T07:19:30.623Z"
-    }
-  ],
-  "updatedAt": "2026-07-01T07:19:38.858Z"
-}
+
