@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>運行情報 txt 自動同期ツール</title>
   <style>
+.card-body.grid label:has(#workerUrl){display:none}
     :root {
       --bg: #0f172a;
       --card: #111827;
@@ -226,7 +227,7 @@
       <div class="card-body grid">
         <label>
           GitHub同期先 Worker URL
-          <input id="workerUrl" placeholder="https://train-delay-sync.minamikaze2700.workers.dev" />
+          <input id="workerUrl" value="https://train-delay-sync.minamikaze2700.workers.dev" readonly />
         </label>
         <div class="row2">
           <label>
@@ -372,20 +373,10 @@ function buildLine(item) {
   const status = getStatusInfo(item.status);
   const route = item.routeJa ? normalizeJapaneseInput(item.routeJa) : "";
   const routeEn = sanitizeEnglish(item.routeEn);
-  const time = item.time ? normalizeJapaneseInput(item.time) : "";
-  const reason = item.reason ? normalizeJapaneseInput(item.reason) : "";
-  const note = item.note ? normalizeJapaneseInput(item.note) : "";
+  const time = item.time ? normalizeJapaneseInput(item.time) + "頃" : "";
+  const reason = item.reason ? normalizeJapaneseInput(item.reason) + "のため、": "";
 
-  const parts = [];
-  if (route) parts.push(`${route}は`);
-  if (time) parts.push(`${time}頃`);
-  if (route || time) parts.push("　");
-  if (reason) parts.push(`${reason}のため、`);
-  parts.push(`${status.ja}。`);
-  if (note) parts.push(`${note}　`);
-  else parts.push("　");
-  parts.push(`${routeEn}/${status.en}`);
-  return parts.join("");
+  return `${route}は${time}　${reason}${status.ja}。　${routeEn}/${status.en}`;
 }
 
 function generateText(items) {
